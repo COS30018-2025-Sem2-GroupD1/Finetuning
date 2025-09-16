@@ -1,3 +1,40 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+Distill answers from a local teacher model (e.g., model/medgemma-27b-text-it)
+on healthcaremagic.jsonl and save Alpaca-style JSONL for later fine-tuning.
+
+Two modes (--command):
+  - text : Text-only distillation (just generated answer).
+  - soft : Soft-label distillation (generated answer + per-token top-k logprobs).
+
+Understands nested "sft" format:
+{
+  "source": "...",
+  "id": "...",
+  "task": "...",
+  "sft": {"instruction":"...","input":"...","output":"..."},
+  "meta": {...}
+}
+
+Output record schema (Alpaca-style):
+{
+  "instruction": "...",
+  "input": "Question: ...\\nContext:\\n... (optional)",
+  "output": "<teacher answer>",
+  "source": "healthcaremagic_distilled_medgemma-27b-text-it",
+  "id": "<orig-id-or-index>",
+  "task": "distillation",
+  "meta": {
+    "gen": {"max_new_tokens":..., "temperature":..., "do_sample":...},
+    "gen_token_count": <int>,       # only for --command soft
+    "gold": "<gold if --include-gold and available>"
+  },
+  # when --command soft and no --logprobs-file:
+  # "soft_labels": {"topk": <k>, "steps": [{"t":..., "chosen_id":..., "topk_ids":[...], "topk_logprobs":[...]}]}
+}
+"""
+
 import os
 import sys
 import json
@@ -6,15 +43,19 @@ import time
 import argparse
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
+import traceback
 
 import torch
+torch.set_float32_matmul_precision('high')
 from transformers import AutoTokenizer, AutoModelForCausalLM
 try:
     from transformers import GenerationConfig
 except ImportError:
     from transformers.generation.configuration_utils import GenerationConfig
 
-from tqdm import tqdm
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", handlers=[logging.StreamHandler(), logging.FileHandler("distil.log")])
 
 # -------------------------------
 # Robust JSONL I/O
@@ -149,6 +190,7 @@ def _make_generation_config(tok, model, temperature: float) -> GenerationConfig:
                 setattr(cfg, attr, None)
             except Exception:
                 pass
+
     # ensure ids
     cfg.pad_token_id = tok.pad_token_id
     cfg.eos_token_id = tok.eos_token_id
@@ -186,7 +228,7 @@ def load_teacher(teacher_dir: Path, force_slow: bool=False, trust_remote_code: b
 
     # choose dtype argument name based on Transformers version
     use_kwargs = {"device_map": "auto", "trust_remote_code": trust_remote_code}
-    dtype_val = torch.bfloat16 if torch.cuda.is_available() else None
+    dtype_val = torch.float32 # if torch.cuda.is_bf16_supported() else torch.float16 if torch.cuda.is_available() else None
 
     model = AutoModelForCausalLM.from_pretrained(str(teacher_dir), **use_kwargs, torch_dtype=dtype_val, low_cpu_mem_usage=True)
 
@@ -201,23 +243,25 @@ def load_teacher(teacher_dir: Path, force_slow: bool=False, trust_remote_code: b
 
 # Hard labelling
 @torch.no_grad()
-def generate_answer(tok, model, prompt: str, max_new_tokens: int, temperature: float) -> str:
-    enc = tok(prompt, return_tensors="pt").to(model.device)
+def generate_answer(tok, model, prompts: list[str], max_new_tokens: int, temperature: float) -> list[str]:
+    enc = tok(prompts, return_tensors="pt", padding=True, truncation=True).to(model.device)
     gen_cfg = _make_generation_config(tok, model, temperature)
     out = model.generate(
         **enc,
         max_new_tokens=max_new_tokens,
         generation_config=gen_cfg,
         )
-    full = tok.decode(out[0], skip_special_tokens=True)
-    pre  = tok.decode(enc.input_ids[0], skip_special_tokens=True)
-    return full[len(pre):].strip()
+    full = tok.batch_decode(out, skip_special_tokens=True)
+    pre  = tok.batch_decode(enc.input_ids, skip_special_tokens=True)
+
+    gens = [f[len(p):].strip() for f, p in zip(full, pre)]
+    return gens
 
 # Soft labelling
 @torch.no_grad()
-def generate_with_scores(tok, model, prompt: str, max_new_tokens: int, temperature: float):
+def generate_with_scores(tok, model, prompts: list[str], max_new_tokens: int, temperature: float) -> list[dict]:
     """Return generated text + per-step logits for soft-label extraction."""
-    enc = tok(prompt, return_tensors="pt").to(model.device)
+    enc = tok(prompts, return_tensors="pt", padding=True, truncation=True).to(model.device)
     out = model.generate(
         **enc,
         max_new_tokens=max_new_tokens,
@@ -229,13 +273,25 @@ def generate_with_scores(tok, model, prompt: str, max_new_tokens: int, temperatu
         return_dict_in_generate=True,
         output_scores=True
     )
-    seq = out.sequences[0]
-    prompt_len = enc.input_ids.shape[1]
-    gen_ids = seq[prompt_len:]
-    full_text = tok.decode(seq, skip_special_tokens=True)
-    prompt_text = tok.decode(enc.input_ids[0], skip_special_tokens=True)
-    gen_text = full_text[len(prompt_text):].strip()
-    return {"generated_text": gen_text, "generated_ids": gen_ids.detach().cpu(), "scores": out.scores}
+    seq = out.sequences
+    prompt_len_list = enc.attention_mask.sum(dim=1).tolist()
+    # gen_ids = seq[prompt_len:]
+    gen_ids_list = [s[p_len:] for s, p_len in zip(seq, prompt_len_list)]
+    full_text = tok.batch_decode(seq, skip_special_tokens=True)
+    prompt_text = tok.batch_decode(enc.input_ids, skip_special_tokens=True)
+    # gen_text = full_text[len(prompt_text):].strip()
+    gen_text_list = [ f[len(p):].strip() for f, p in zip(full_text, prompt_text)]
+    # return {"generated_text": gen_text, "generated_ids": gen_ids.detach().cpu(), "scores": out.scores}
+
+    scores_per_batch = []
+    for b in range(seq.shape[0]):
+        scores_per_batch.append([score[b] for score in out.scores])
+
+    generate_with_scores_list = []
+    for gen_text, gen_ids, score in zip(gen_text_list, gen_ids_list, scores_per_batch):
+        generate_with_scores_list.append({"generated_text": gen_text, "generated_ids": gen_ids.detach().cpu(), "scores": score})
+
+    return generate_with_scores_list
 
 def topk_logprobs_per_step(scores_list: List[torch.Tensor], gen_ids: torch.Tensor, k: int):
     """For each generated step t, take top-k tokens with their log-probs and mark the chosen id."""
@@ -244,8 +300,13 @@ def topk_logprobs_per_step(scores_list: List[torch.Tensor], gen_ids: torch.Tenso
     out = []
     logsoftmax = torch.nn.LogSoftmax(dim=-1)
     for t, logits in enumerate(scores_list):
+        if logits is None or logits.numel() == 0:
+            continue
         lp = logsoftmax(logits[0].float().cpu())
-        topv, topi = torch.topk(lp, k)
+        if lp.dim() == 0:
+            continue
+        topk = min(k, lp.shape[-1])
+        topv, topi = torch.topk(lp, topk)
         out.append({
             "t": t,
             "chosen_id": int(gen_ids[t].item()),
@@ -268,6 +329,7 @@ def main():
     ap.add_argument("--max-samples", type=int, default=None, help="Limit examples for a quick run")
     ap.add_argument("--resume", action="store_true", help="Skip ids already present in out-jsonl")
     ap.add_argument("--include-gold", action="store_true", help="If available, include original gold in meta.gold")
+    ap.add_argument("--batch-size",default=8,type=int, help="Batch to process parallel")
 
     # Generation
     ap.add_argument("--instruction", default=DEFAULT_INSTRUCTION, help="Fallback instruction")
@@ -291,6 +353,9 @@ def main():
     ap.add_argument("--id-keys",       default=None, help="Comma-separated keys for id")
     args = ap.parse_args()
 
+    logging.info("------------Distillation statred ---------------------- ")
+    logging.info(f"Args: {args}")
+
     data_path = Path(args.data_file)
     out_path  = Path(args.out_jsonl)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -303,6 +368,7 @@ def main():
     id_keys = parse_key_list(args.id_keys,       DEFAULT_ID_KEYS)
 
     # Load teacher with robust tokenizer handling
+    logging.info("Loading teacher and student with robust tokenizer...")
     tok, model = load_teacher(Path(args.teacher_dir),
                               force_slow=args.force_slow_tokenizer,
                               trust_remote_code=args.trust_remote_code)
@@ -310,6 +376,7 @@ def main():
     # Resume: load already written ids to skip
     already = set()
     if args.resume and out_path.exists():
+        logging.info("Resume - Load already writtien ids to skip...")
         if flog: flog.write(f"[resume] Reading existing ids from {out_path}\n")
         with out_path.open("r", encoding="utf-8") as fin:
             for line in fin:
@@ -321,11 +388,15 @@ def main():
                     pass
 
     # Read data
+    logging.info("Readding the data from dataset...")
     rows_raw = list(read_jsonl(data_path))
     if args.max_samples is not None:
         rows_raw = rows_raw[:args.max_samples]
 
+    logging.info(f"Succesfully loaded {len(rows_raw)} rows from dataset")
+
     if not rows_raw:
+        logging.info("No rows found in data file")
         print("ERROR: No rows found in data file.")
         sys.exit(1)
 
@@ -357,89 +428,134 @@ def main():
     n_skip = 0
     t0 = time.time()
 
+    batch_size = args.batch_size
+
     with out_path.open("a", encoding="utf-8") as fout:
-        for i, obj in enumerate(rows_raw):
-            instr, inp_text, ctx, gold, rid = extract_fields_any(obj, q_keys, a_keys, c_keys, id_keys, args.instruction)
-            if rid is None:
-                rid = str(i)
+        for start in range(0, len(rows_raw), batch_size):
+            batch_obj = rows_raw[start:start+batch_size]
 
-            if args.resume and rid in already:
-                n_skip += 1
-                continue
+            prompts = []
+            instr_list = []
+            inp_block_list = []
+            gold_list = []
+            rid_list = []
 
-            if not inp_text or not inp_text.strip():
-                n_skip += 1
-                if flog: flog.write(f"[skip] idx={i} id={rid} (no input/question)\n")
-                continue
-            input_block = build_input_block(inp_text, ctx)
-            prompt = build_prompt(instr or args.instruction, input_block)
+            batch_start_idx = start
+            last_processed_idx = None
+            last_processed_rid = None
 
-            try:
-                if mode == "text":
-                    gen = generate_answer(tok, model, prompt, args.max_new_tokens, args.temperature)
-                    rec = {
-                        "instruction": instr or args.instruction,
-                        "input": input_block,
-                        "output": gen,
-                        "source": "healthcaremagic_distilled_medgemma-27b-text-it",
-                        "id": rid,
-                        "task": "distillation",
-                        "meta": {
-                            "gen": {
-                                "max_new_tokens": args.max_new_tokens,
-                                "temperature": args.temperature,
-                                "do_sample": (args.temperature > 0.0)
+            for i, obj in enumerate(batch_obj, start=start):
+                if i % 100 == 0:
+                    logging.info(f"Progress: {i}/{n_total}, emitted={n_emit} skipped={n_skip}")
+                instr, inp_text, ctx, gold, rid = extract_fields_any(obj, q_keys, a_keys, c_keys, id_keys, args.instruction)
+                if rid is None:
+                    rid = str(i)
+
+                last_processed_idx = i
+                last_processed_rid = rid
+
+                if args.resume and rid in already:
+                    n_skip += 1
+                    continue
+
+                if not inp_text or not inp_text.strip():
+                    n_skip += 1
+                    if flog: flog.write(f"[skip] idx={i} id={rid} (no input/question)\n")
+                    continue
+
+                input_block = build_input_block(inp_text, ctx)
+                prompt = build_prompt(instr or args.instruction, input_block)
+                prompts.append(prompt)
+                instr_list.append(instr)
+                inp_block_list.append(input_block)
+                gold_list.append(gold)
+                rid_list.append(rid)
+
+            if prompts:
+                try:
+                    if mode == "text":
+                        gens = generate_answer(tok, model, prompts, args.max_new_tokens, args.temperature)
+                        for gen, instr, input_block, gold, rid in zip(gens, instr_list, inp_block_list, gold_list, rid_list):
+                            rec = {
+                                "instruction": instr or args.instruction,
+                                "input": input_block,
+                                "output": gen,
+                                "source": "healthcaremagic_distilled_medgemma-27b-text-it",
+                                "id": rid,
+                                "task": "distillation",
+                                "meta": {
+                                    "gen": {
+                                        "max_new_tokens": args.max_new_tokens,
+                                        "temperature": args.temperature,
+                                        "do_sample": (args.temperature > 0.0)
+                                    }
+                                }
                             }
-                        }
-                    }
-                    if args.include_gold and gold is not None:
-                        rec["meta"]["gold"] = gold
-                    fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                    n_emit += 1
+                            if args.include_gold and gold is not None:
+                                rec["meta"]["gold"] = gold
+                            fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                            n_emit += 1
 
-                else:  # soft
-                    out = generate_with_scores(tok, model, prompt, args.max_new_tokens, args.temperature)
-                    gen_text = out["generated_text"]
-                    gen_ids  = out["generated_ids"]
-                    scores   = out["scores"]
+                    else:  # soft
+                        out = generate_with_scores(tok, model, prompts, args.max_new_tokens, args.temperature)
+                        for o, instr, input_block, rid, gold in zip(out, instr_list, inp_block_list, rid_list, gold_list):
+                            gen_text = o["generated_text"]
+                            gen_ids  = o["generated_ids"]
+                            scores   = o["scores"]
 
-                    rec = {
-                        "instruction": instr or args.instruction,
-                        "input": input_block,
-                        "output": gen_text,
-                        "source": "healthcaremagic_distilled_medgemma-27b-text-it",
-                        "id": rid,
-                        "task": "distillation",
-                        "meta": {
-                            "gen": {
-                                "max_new_tokens": args.max_new_tokens,
-                                "temperature": args.temperature,
-                                "do_sample": (args.temperature > 0.0)
-                            },
-                            "gen_token_count": int(gen_ids.numel())
-                        }
-                    }
-                    if args.include_gold and gold is not None:
-                        rec["meta"]["gold"] = gold
+                            rec = {
+                                "instruction": instr or args.instruction,
+                                "input": input_block,
+                                "output": gen_text,
+                                "source": "healthcaremagic_distilled_medgemma-27b-text-it",
+                                "id": rid,
+                                "task": "distillation",
+                                "meta": {
+                                    "gen": {
+                                        "max_new_tokens": args.max_new_tokens,
+                                        "temperature": args.temperature,
+                                        "do_sample": (args.temperature > 0.0)
+                                    },
+                                    "gen_token_count": int(gen_ids.numel())
+                                }
+                            }
+                            if args.include_gold and gold is not None:
+                                rec["meta"]["gold"] = gold
 
-                    if args.topk_logprobs > 0:
-                        soft = topk_logprobs_per_step(scores, gen_ids, k=args.topk_logprobs)
-                        if soft_f is not None:
-                            soft_rec = {"id": rid, "topk": args.topk_logprobs, "steps": soft}
-                            soft_f.write(json.dumps(soft_rec, ensure_ascii=False) + "\n")
-                        else:
-                            rec["soft_labels"] = {"topk": args.topk_logprobs, "steps": soft}
+                            if args.topk_logprobs > 0:
+                                soft = topk_logprobs_per_step(scores, gen_ids, k=args.topk_logprobs)
+                                if soft_f is not None:
+                                    soft_rec = {"id": rid, "topk": args.topk_logprobs, "steps": soft}
+                                    soft_f.write(json.dumps(soft_rec, ensure_ascii=False) + "\n")
+                                else:
+                                    rec["soft_labels"] = {"topk": args.topk_logprobs, "steps": soft}
 
-                    fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                    n_emit += 1
+                            fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                            n_emit += 1
 
-                if flog and (n_emit % 10 == 0):
-                    flog.write(f"[ok ] {n_emit}/{n_total} id={rid}\n")
+                    if flog and (n_emit % 10 == 0):
+                        flog.write(f"[ok] batch processed, total emitted = {n_emit}\n")
 
-            except Exception as e:
-                n_skip += 1
-                if flog:
-                    flog.write(f"[err] idx={i} id={rid} error={repr(e)}\n")
+                except Exception as e:
+                    # n_skip += len(prompts)
+
+                    # error_msg = f"[err] batch_start={batch_start_idx}, last_idx={last_processed_idx}, last_rid={last_processed_rid}, error={repr(e)}"
+                    # if flog:
+                    #     flog.write(error_msg + "\n")
+                    # logging.error(error_msg)
+                    n_skip += len(prompts)
+                    tb_str = traceback.format_exc()
+                    error_msg = (
+                        f"[err] batch_start={batch_start_idx}, "
+                        f"last_idx={last_processed_idx}, "
+                        f"last_rid={last_processed_rid}, "
+                        f"error={repr(e)}\n{tb_str}"
+                    )
+                    if flog:
+                        flog.write(error_msg + "\n")
+                    logging.error(error_msg)
+
+        logging.info(f"Post try: emitted={n_emit}, skipped={n_skip}")
 
     if soft_f is not None:
         soft_f.close()
@@ -453,8 +569,10 @@ def main():
         print("WARNING: No examples emitted. Check field keys and inputs.")
     else:
         print(f"Done. Wrote {n_emit} distilled examples to: {out_path}")
+        logging.info(f"Done. Wrote {n_emit} ditilled to: {out_path}")
         if mode == "soft" and args.topk_logprobs > 0 and args.logprobs_file:
             print(f"Soft labels saved to: {args.logprobs_file}")
 
 if __name__ == "__main__":
     main()
+                                                                    
