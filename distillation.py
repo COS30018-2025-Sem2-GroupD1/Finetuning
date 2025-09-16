@@ -44,7 +44,7 @@ import argparse
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 import traceback
-
+# Torch and transformer ver-specific import
 import torch
 torch.set_float32_matmul_precision('high')
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -56,6 +56,7 @@ except ImportError:
 import logging
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", handlers=[logging.StreamHandler(), logging.FileHandler("distil.log")])
+
 
 # -------------------------------
 # Robust JSONL I/O
@@ -73,6 +74,7 @@ def parse_key_list(arg: Optional[str], default_list: List[str]) -> List[str]:
         return default_list
     return [x.strip() for x in arg.split(",") if x.strip()]
 
+
 # -------------------------------
 # Field autodetection (overridable)
 # -------------------------------
@@ -89,6 +91,7 @@ def pick_first(d: Dict[str, Any], keys: List[str]) -> Optional[str]:
                 return str(v)
     return None
 
+
 def extract_fields_flat(
     obj: Dict[str, Any],
     q_keys: List[str],
@@ -101,6 +104,7 @@ def extract_fields_flat(
     cx = pick_first(obj, c_keys)
     _id = pick_first(obj, id_keys)
     return q, a, cx, _id
+
 
 def extract_fields_any(
     obj: Dict[str, Any],
@@ -124,7 +128,6 @@ def extract_fields_any(
         if rid is None:
             rid = pick_first(obj, DEFAULT_ID_KEYS)
         return instruction, input_text, context, gold, (rid if rid is not None else None)
-
     # Flat fallback
     q, a, cx, rid2 = extract_fields_flat(obj, q_keys, a_keys, c_keys, id_keys)
     instruction = default_instruction
@@ -134,6 +137,7 @@ def extract_fields_any(
     rid_final   = rid if rid is not None else rid2
     return instruction, input_text, context, gold, (rid_final if rid_final is not None else None)
 
+
 # -------------------------------
 # Prompt construction (Alpaca-style)
 # -------------------------------
@@ -141,12 +145,14 @@ DEFAULT_INSTRUCTION = (
     "Answer the patient's question accurately and concisely. Include a brief clinical rationale."
 )
 
+
 def build_input_block(question_or_input: str, context: Optional[str]) -> str:
     q = (question_or_input or "").strip()
     inp = f"Question: {q}" if q else "Question:"
     if context and context.strip():
         inp += f"\nContext:\n{context.strip()}"
     return inp
+
 
 def build_prompt(instruction: str, input_block: str) -> str:
     return (
@@ -156,6 +162,7 @@ def build_prompt(instruction: str, input_block: str) -> str:
         f"{input_block.strip()}\n\n"
         "### Response:\n"
     )
+
 
 # -------------------------------
 # Teacher loader & generation
@@ -172,6 +179,7 @@ def _ensure_pad_eos(tok, model) -> None:
     model.config.pad_token_id = tok.pad_token_id
     if hasattr(model, "generation_config") and model.generation_config is not None:
         model.generation_config.pad_token_id = tok.pad_token_id
+
 
 def _make_generation_config(tok, model, temperature: float) -> GenerationConfig:
     """
@@ -190,17 +198,26 @@ def _make_generation_config(tok, model, temperature: float) -> GenerationConfig:
                 setattr(cfg, attr, None)
             except Exception:
                 pass
-
     # ensure ids
     cfg.pad_token_id = tok.pad_token_id
     cfg.eos_token_id = tok.eos_token_id
-
+    # if temp available
     if temperature and temperature > 0.0:
         cfg.do_sample = True
         cfg.temperature = float(temperature)
         # leave top_p/top_k unset (None) unless you explicitly want them
 
     return cfg
+
+
+def _max_input_len(model, max_new_tokens: int, safety_margin: int = 8) -> int:
+    """
+    Compute a safe max input length from the model context window and pass it to the tokenizer.
+    """
+    ctx = getattr(model.config, "max_position_embeddings",
+                  getattr(model.config, "n_positions", 4096))
+    return max(128, int(ctx) - int(max_new_tokens) - safety_margin)
+
 
 def load_teacher(teacher_dir: Path, force_slow: bool=False, trust_remote_code: bool=False):
     """
@@ -209,7 +226,7 @@ def load_teacher(teacher_dir: Path, force_slow: bool=False, trust_remote_code: b
     """
     tok = None
     tok_err = None
-
+    # If force slow, use AutoTokenizer with use_fast param
     if not force_slow:
         try:
             tok = AutoTokenizer.from_pretrained(
@@ -218,22 +235,20 @@ def load_teacher(teacher_dir: Path, force_slow: bool=False, trust_remote_code: b
         except Exception as e:
             tok_err = e
             tok = None
-
+    # Fallback tokenizer
     if tok is None:
         tok = AutoTokenizer.from_pretrained(
             str(teacher_dir), use_fast=False, trust_remote_code=trust_remote_code
         )
-
+    # Config pref
     tok.padding_side = "left"
-
     # choose dtype argument name based on Transformers version
     use_kwargs = {"device_map": "auto", "trust_remote_code": trust_remote_code}
     dtype_val = torch.float32 # if torch.cuda.is_bf16_supported() else torch.float16 if torch.cuda.is_available() else None
-
     model = AutoModelForCausalLM.from_pretrained(str(teacher_dir), **use_kwargs, torch_dtype=dtype_val, low_cpu_mem_usage=True)
-
+    # Ensure pad
     _ensure_pad_eos(tok, model)
-
+    # Logs
     if tok_err is not None:
         print("[warn] Fast tokenizer failed; using slow tokenizer.")
         print(f"       Fast error: {repr(tok_err)}")
@@ -241,38 +256,49 @@ def load_teacher(teacher_dir: Path, force_slow: bool=False, trust_remote_code: b
         print("Load model and tokenizer successfully")
     return tok, model
 
+
 # Hard labelling
 @torch.no_grad()
 def generate_answer(tok, model, prompts: list[str], max_new_tokens: int, temperature: float) -> list[str]:
-    enc = tok(prompts, return_tensors="pt", padding=True, truncation=True).to(model.device)
+    max_inp = _max_input_len(model, max_new_tokens) # Ensure consistency
+    enc = tok(prompts, return_tensors="pt", padding=True, truncation=True, max_length=max_inp).to(model.device)
+    # Generation
     gen_cfg = _make_generation_config(tok, model, temperature)
-    out = model.generate(
-        **enc,
-        max_new_tokens=max_new_tokens,
-        generation_config=gen_cfg,
-        )
-    full = tok.batch_decode(out, skip_special_tokens=True)
-    pre  = tok.batch_decode(enc.input_ids, skip_special_tokens=True)
-
-    gens = [f[len(p):].strip() for f, p in zip(full, pre)]
-    return gens
-
-# Soft labelling
-@torch.no_grad()
-def generate_with_scores(tok, model, prompts: list[str], max_new_tokens: int, temperature: float) -> list[dict]:
-    """Return generated text + per-step logits for soft-label extraction."""
-    enc = tok(prompts, return_tensors="pt", padding=True, truncation=True).to(model.device)
     out = model.generate(
         **enc,
         max_new_tokens=max_new_tokens,
         do_sample=(temperature > 0.0),
         temperature=(temperature if temperature > 0.0 else None),
-        repetition_penalty=1.0,
+        use_cache=True,
+        pad_token_id=tok.pad_token_id,
+        eos_token_id=tok.eos_token_id,
+    )
+    full = tok.batch_decode(out, skip_special_tokens=True)
+    pre  = tok.batch_decode(enc.input_ids, skip_special_tokens=True)
+    # Normalise and process
+    gens = [f[len(p):].strip() for f, p in zip(full, pre)]
+    return gens
+
+
+# Soft labelling
+@torch.no_grad()
+def generate_with_scores(tok, model, prompts: list[str], max_new_tokens: int, temperature: float) -> list[dict]:
+    """Return generated text + per-step logits for soft-label extraction."""
+    max_inp = _max_input_len(model, max_new_tokens)
+    enc = tok(prompts, return_tensors="pt", padding=True, truncation=True, max_length=max_inp).to(model.device)
+    # Generation
+    out = model.generate(
+        **enc,
+        max_new_tokens=max_new_tokens,
+        do_sample=(temperature > 0.0),
+        temperature=(temperature if temperature > 0.0 else None),
+        use_cache=True,
         pad_token_id=tok.pad_token_id,
         eos_token_id=tok.eos_token_id,
         return_dict_in_generate=True,
         output_scores=True
     )
+    # Append res
     seq = out.sequences
     prompt_len_list = enc.attention_mask.sum(dim=1).tolist()
     # gen_ids = seq[prompt_len:]
@@ -282,16 +308,16 @@ def generate_with_scores(tok, model, prompts: list[str], max_new_tokens: int, te
     # gen_text = full_text[len(prompt_text):].strip()
     gen_text_list = [ f[len(p):].strip() for f, p in zip(full_text, prompt_text)]
     # return {"generated_text": gen_text, "generated_ids": gen_ids.detach().cpu(), "scores": out.scores}
-
+    # Stack scores
     scores_per_batch = []
     for b in range(seq.shape[0]):
         scores_per_batch.append([score[b] for score in out.scores])
-
+    # Normalise and generate output with scores
     generate_with_scores_list = []
     for gen_text, gen_ids, score in zip(gen_text_list, gen_ids_list, scores_per_batch):
         generate_with_scores_list.append({"generated_text": gen_text, "generated_ids": gen_ids.detach().cpu(), "scores": score})
-
     return generate_with_scores_list
+
 
 def topk_logprobs_per_step(scores_list: List[torch.Tensor], gen_ids: torch.Tensor, k: int):
     """For each generated step t, take top-k tokens with their log-probs and mark the chosen id."""
@@ -300,20 +326,32 @@ def topk_logprobs_per_step(scores_list: List[torch.Tensor], gen_ids: torch.Tenso
     out = []
     logsoftmax = torch.nn.LogSoftmax(dim=-1)
     for t, logits in enumerate(scores_list):
-        if logits is None or logits.numel() == 0:
+        if logits is None:
             continue
-        lp = logsoftmax(logits[0].float().cpu())
-        if lp.dim() == 0:
+        logits = logits.detach().float().cpu()
+        if logits.numel() == 0:
             continue
-        topk = min(k, lp.shape[-1])
+        # logits can be [vocab] (after score[b]) or [1, vocab]
+        if logits.dim() == 2:
+            logits = logits.squeeze(0)
+        if logits.dim() != 1:
+            # Unexpected; skip defensively
+            continue
+        # vocab with softmax layers
+        lp = logsoftmax(logits)  # [vocab]
+        vocab = lp.shape[0]
+        topk = min(k, vocab)
         topv, topi = torch.topk(lp, topk)
+        # Prepare template
+        chosen_id = int(gen_ids[t].item()) if t < gen_ids.numel() else None
         out.append({
             "t": t,
-            "chosen_id": int(gen_ids[t].item()),
+            "chosen_id": chosen_id,
             "topk_ids": [int(i) for i in topi.tolist()],
             "topk_logprobs": [float(v) for v in topv.tolist()]
         })
     return out
+
 
 # -------------------------------
 # Main
@@ -355,7 +393,7 @@ def main():
 
     logging.info("------------Distillation statred ---------------------- ")
     logging.info(f"Args: {args}")
-
+    # Paths
     data_path = Path(args.data_file)
     out_path  = Path(args.out_jsonl)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -423,11 +461,12 @@ def main():
         soft_path.parent.mkdir(parents=True, exist_ok=True)
         soft_f = gzip.open(soft_path, "wt", encoding="utf-8") if soft_path.suffix == ".gz" else open(soft_path, "w", encoding="utf-8")
 
+    # Checkers
     n_total = len(rows_raw)
     n_emit = 0
     n_skip = 0
     t0 = time.time()
-
+    # Batch configs
     batch_size = args.batch_size
 
     with out_path.open("a", encoding="utf-8") as fout:
