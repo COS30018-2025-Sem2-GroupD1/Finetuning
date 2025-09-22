@@ -7,3 +7,5 @@ numpy==2.1.2
 sentence-transformers==3.0.1
 google-generativeai==0.7.2
 pydantic==2.9.2
+starlette==0.38.6
+protobuf==4.25.8
