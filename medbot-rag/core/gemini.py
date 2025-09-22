@@ -25,7 +25,7 @@ def build_prompt(question: str, contexts: List[dict], locale: str | None = "en")
     for i, c in enumerate(contexts, 1):
         cid = c.get("id") or c.get("_id") or f"ctx-{i}"
         snip = (c.get("snippet") or c.get("text") or "")[:600]
-        score = c.get("score", 0)
+		score = c.get("score") or c.get("_score") or 0.0
         ctx_lines.append(f"- id: {cid} | score: {score:.3f} | text: {snip}")
     user_text = (
         f"Locale: {locale}\n"

@@ -65,9 +65,10 @@ def to_contexts(
         item = {
             "id": str(h.get("_id", f"ctx-{i}")),
             "text": (h.get("text") or "")[:max_chars],
-            "_score": float(h.get("_score", 0.0)),
+            "score": float(h.get("_score", 0.0)),
         }
         if keep_vector and "vector" in h:
             item["vector"] = h["vector"]
         out.append(item)
     return out
+

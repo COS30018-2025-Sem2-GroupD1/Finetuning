@@ -1,74 +1,104 @@
-import os
-import typing as t
-
+from __future__ import annotations
+from typing import Iterable, List, Optional
 import numpy as np
-from sentence_transformers import SentenceTransformer
 
 try:
     import torch
-except Exception: 
-    torch = None 
+except Exception:
+    torch = None
 
-_DEFAULT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-_ENCODER: SentenceTransformer | None = None
+from sentence_transformers import SentenceTransformer
+
+_ENCODER: Optional[SentenceTransformer] = None
+_MODEL_NAME: Optional[str] = None
 
 
 def _pick_device() -> str:
-    prefer = os.getenv("EMBED_DEVICE", "").lower()
-    if prefer in {"cuda", "cpu", "mps"}:
-        return prefer
-    if torch is not None and getattr(torch, "cuda", None) and torch.cuda.is_available():
+    if torch is None:
+        return "cpu"
+    if torch.cuda.is_available():
         return "cuda"
-    if (
-        torch is not None
-        and hasattr(torch, "backends")
-        and hasattr(torch.backends, "mps")
-        and torch.backends.mps.is_available()
-    ):
+    # Apple Silicon
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available(): 
         return "mps"
     return "cpu"
 
 
+# Encoder lifecycle
+def set_encoder(model_name: str) -> None:
+    global _ENCODER, _MODEL_NAME
+    _MODEL_NAME = model_name
+    _ENCODER = SentenceTransformer(model_name, device=_pick_device())
+
+
 def get_encoder() -> SentenceTransformer:
-    global _ENCODER
     if _ENCODER is None:
-        name = os.getenv("EMBED_MODEL", _DEFAULT_MODEL)
-        _ENCODER = SentenceTransformer(name, device=_pick_device())
+        raise RuntimeError("Encoder not initialized. Call set_encoder(model_name) first.")
     return _ENCODER
 
 
-def embedding_dim() -> int:
-    return get_encoder().get_sentence_embedding_dimension()
+# Normalization helpers
+def _l2_normalize(X: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    if X.ndim == 1:
+        denom = np.linalg.norm(X) + eps
+        return (X / denom).astype(np.float32)
+    denom = np.linalg.norm(X, axis=1, keepdims=True) + eps
+    return (X / denom).astype(np.float32)
 
 
-def encode(text: str) -> np.ndarray:
-    vec = get_encoder().encode(
-        text,
-        convert_to_numpy=True,
-        normalize_embeddings=True,
-        show_progress_bar=False,
-    )
-    return vec.astype(np.float32, copy=False)
-
-
-def encode_many(texts: t.Sequence[str], batch_size: int = 64) -> np.ndarray:
-    vecs = get_encoder().encode(
+# Encoding APIs
+def encode_many(
+    texts: Iterable[str],
+    batch_size: int = 128,
+    normalize: bool = True,
+    to_numpy: bool = True,
+) -> np.ndarray:
+    """
+    Encode a batch of texts. Returns np.ndarray [N, D], float32.
+    - normalize=True ensures cosine-friendly vectors.
+    """
+    enc = get_encoder()
+    emb = enc.encode(
         list(texts),
-        convert_to_numpy=True,
         batch_size=batch_size,
-        normalize_embeddings=True,
+        convert_to_numpy=True,
         show_progress_bar=False,
+        normalize_embeddings=False,
     )
-    return vecs.astype(np.float32, copy=False)
+    if not isinstance(emb, np.ndarray):
+        emb = np.asarray(emb)
+    emb = emb.astype(np.float32, copy=False)
+    if normalize:
+        emb = _l2_normalize(emb)
+    return emb if to_numpy else emb 
 
 
-def get_model() -> SentenceTransformer:  
-    return get_encoder()
+def encode_one(
+    text: str,
+    normalize: bool = True,
+) -> np.ndarray:
+    """
+    Encode a single text to shape [D], float32.
+    """
+    vec = encode_many([text], batch_size=1, normalize=normalize)
+    return vec[0]
 
 
-def embed_query(text: str) -> list[float]:
-    return encode(text).tolist()
+def embedding_dim() -> int:
+    """
+    Inspect the current encoder to get output embedding dimension.
+    """
+    enc = get_encoder()
+    # Robust way: encode a tiny sample and read shape
+    sample = enc.encode(["_"], convert_to_numpy=True, normalize_embeddings=False)
+    if isinstance(sample, np.ndarray):
+        return int(sample.shape[-1])
+    sample = np.asarray(sample)
+    return int(sample.shape[-1])
 
 
-def embed_corpus(texts: t.Sequence[str], batch_size: int = 64) -> list[list[float]]:
-    return encode_many(texts, batch_size=batch_size).tolist()
+def current_model_name() -> Optional[str]:
+    """
+    Return the last model_name passed to set_encoder, for logging.
+    """
+    return _MODEL_NAME
