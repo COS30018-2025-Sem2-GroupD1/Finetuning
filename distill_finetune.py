@@ -19,7 +19,7 @@ Optional external soft labels JSONL(.gz): {"id":"...", "topk":K, "steps":[...]} 
 Example (resume from previous LoRA checkpoint and QLoRA):
   python scripts/distill_finetune.py \
     --model-dir model/medalpaca-7b \
-    --data-json data/healthcaremagic_distilled.jsonl \
+    --data-json data/healthcaremagic_distillation.jsonl \
     --out-dir checkpoints/medalpaca_pubmedqa_lora_v2 \
     --use-qlora --bf16 --gradient-checkpointing \
     --resume-adapter-dir checkpoints/medalpaca_pubmedqa_lora/checkpoint-2000 \
@@ -32,6 +32,7 @@ import os, json, argparse, math, re, gzip, random
 from dataclasses import dataclass
 from typing import Dict, List, Any, Optional, Tuple, Union
 from pathlib import Path
+import transformers, peft
 
 import numpy as np
 import torch
@@ -42,6 +43,7 @@ from transformers import (
     AutoModelForCausalLM, AutoTokenizer,
     Trainer, TrainingArguments, EarlyStoppingCallback
 )
+
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, PeftModel
 import matplotlib.pyplot as plt
 import logging
@@ -401,6 +403,7 @@ def main():
     logger = setup_logger(args.out_dir)
     logger.info("===== Training run started =====")
     logger.info(f"Args: {args}")
+    logger.info(f"Versions — transformers: {transformers.__version__}, peft: {peft.__version__}, torch: {torch.__version__}")
 
     # Load data and split
     all_rows = load_distilled_rows(args.data_json)
@@ -419,9 +422,9 @@ def main():
 
     # Tokenizer / Model
     tok = AutoTokenizer.from_pretrained(args.model_dir, use_fast=True)
+    tok.padding_side = "left"
     if tok.pad_token_id is None and tok.eos_token_id is not None:
         tok.pad_token = tok.eos_token
-    tok.padding_side = "left"
 
     load_kwargs = {}
     if args.use_qlora:
@@ -480,29 +483,87 @@ def main():
         return pad_to_max(batch, tok.pad_token_id)
 
     # ---------- Training args ----------
-    train_args = TrainingArguments(
-        output_dir=args.out_dir,
-        num_train_epochs=args.epochs,
-        per_device_train_batch_size=args.batch_size,
-        gradient_accumulation_steps=args.grad_accum,
-        learning_rate=args.lr,
-        weight_decay=args.weight_decay,
-        warmup_ratio=args.warmup_ratio,
-        lr_scheduler_type=args.scheduler,
-        logging_steps=args.logging_steps,
-        save_steps=args.save_steps,
-        evaluation_strategy="steps",
-        eval_steps=args.eval_steps,
-        save_total_limit=2,
-        load_best_model_at_end=True,
-        metric_for_best_model="eval_loss",
-        greater_is_better=False,
-        bf16=args.bf16,
-        fp16=args.fp16 and not args.bf16,
-        report_to="none",
-        dataloader_pin_memory=False,
-        seed=args.seed,
-    )
+    def _has_field(cls, name: str) -> bool:
+        try:
+            return name in getattr(cls, "__dataclass_fields__", {})
+        except Exception:
+            return False
+
+    # Map your CLI scheduler to whatever this transformers build expects
+    def _scheduler_kwargs(scheduler: str):
+        kw = {}
+        if _has_field(TrainingArguments, "lr_scheduler_type"):
+            kw["lr_scheduler_type"] = scheduler
+        elif _has_field(TrainingArguments, "lr_scheduler"):
+            kw["lr_scheduler"] = scheduler
+        return kw
+
+    # Base kwargs that are almost always present
+    ta_kwargs = {
+        "output_dir": args.out_dir,
+        "num_train_epochs": args.epochs,
+        "per_device_train_batch_size": args.batch_size,
+        "gradient_accumulation_steps": args.grad_accum,
+        "learning_rate": args.lr,
+        "weight_decay": args.weight_decay,
+        "logging_steps": args.logging_steps,
+        "save_steps": args.save_steps,
+        "seed": args.seed,
+    }
+
+    # Optional: warmup
+    if _has_field(TrainingArguments, "warmup_ratio"):
+        ta_kwargs["warmup_ratio"] = args.warmup_ratio
+    elif _has_field(TrainingArguments, "warmup_steps"):
+        # Conservative fallback (can tune later)
+        # If you want exact steps, compute after you know total steps.
+        ta_kwargs["warmup_steps"] = 0
+
+    # Precision flags
+    if _has_field(TrainingArguments, "bf16"):
+        ta_kwargs["bf16"] = args.bf16
+    if _has_field(TrainingArguments, "fp16"):
+        ta_kwargs["fp16"] = (args.fp16 and not args.bf16)
+
+    # Reporting / misc
+    if _has_field(TrainingArguments, "report_to"):
+        ta_kwargs["report_to"] = "none"
+    if _has_field(TrainingArguments, "dataloader_pin_memory"):
+        ta_kwargs["dataloader_pin_memory"] = False
+    if _has_field(TrainingArguments, "save_total_limit"):
+        ta_kwargs["save_total_limit"] = 2
+
+    # Evaluation controls (version-adaptive)
+    eval_enabled = False
+    if _has_field(TrainingArguments, "evaluation_strategy"):
+        ta_kwargs["evaluation_strategy"] = "steps"
+        ta_kwargs["eval_steps"] = args.eval_steps
+        if _has_field(TrainingArguments, "load_best_model_at_end"):
+            ta_kwargs["load_best_model_at_end"] = True
+        if _has_field(TrainingArguments, "metric_for_best_model"):
+            ta_kwargs["metric_for_best_model"] = "eval_loss"
+        if _has_field(TrainingArguments, "greater_is_better"):
+            ta_kwargs["greater_is_better"] = False
+        eval_enabled = True
+    elif _has_field(TrainingArguments, "evaluate_during_training"):
+        # Very old Transformers (pre 3.x)
+        ta_kwargs["evaluate_during_training"] = True
+        # Older builds typically also support eval_steps
+        if _has_field(TrainingArguments, "eval_steps"):
+            ta_kwargs["eval_steps"] = args.eval_steps
+        eval_enabled = True
+    # else: no evaluation support in this build
+
+    # Scheduler
+    ta_kwargs.update(_scheduler_kwargs(args.scheduler))
+
+    # Construct TrainingArguments with the filtered kwargs
+    train_args = TrainingArguments(**ta_kwargs)
+
+    # Early stopping only if evaluation is actually wired
+    callbacks = []
+    if eval_enabled and _has_field(TrainingArguments, "evaluation_strategy"):
+        callbacks.append(EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience))
 
     callbacks = [EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience)]
 
@@ -510,7 +571,7 @@ def main():
         model=model,
         args=train_args,
         train_dataset=train_ds,
-        eval_dataset=val_ds,
+        eval_dataset=val_ds if eval_enabled else None,
         data_collator=collate,
         callbacks=callbacks,
         kd_weight=args.kd_weight,
