@@ -1,43 +1,118 @@
-from typing import List, Optional, Dict
+from __future__ import annotations
+from typing import Dict, Optional, List, Union
+
+import os
+try:
+    import torch
+    _HAS_TORCH = True
+except Exception:
+    _HAS_TORCH = False
+
 from sentence_transformers import SentenceTransformer
-from config import EMBEDDING_CONFIGS
+from config import EMBEDDING_CONFIGS  
 
 _ENCODERS: Dict[str, SentenceTransformer] = {}
-_ACTIVE_PROFILE: Optional[str] = None
+
+_CURRENT_KEY: Optional[str] = None
+
+
+def _device() -> str:
+    if _HAS_TORCH:
+        try:
+            return "cuda" if torch.cuda.is_available() else "cpu"
+        except Exception:
+            return "cpu"
+    return "cpu"
+
+
+def _resolve_model_name(profile: str) -> str:
+    cfg = EMBEDDING_CONFIGS.get(profile, {})
+    name = cfg.get("model") or cfg.get("hf_model")
+    if not name:
+        raise KeyError(f"Profile '{profile}' is missing 'hf_model' (or 'model').")
+    return name
 
 
 def init_encoder_from_config(profile: str) -> SentenceTransformer:
-    global _ENCODERS, _ACTIVE_PROFILE
-
     if profile not in EMBEDDING_CONFIGS:
-        raise ValueError(f"Unknown profile '{profile}'. Options: {list(EMBEDDING_CONFIGS.keys())}")
-
+        raise ValueError(
+            f"Unknown profile '{profile}'. Options: {list(EMBEDDING_CONFIGS.keys())}"
+        )
     if profile not in _ENCODERS:
-        model_name = EMBEDDING_CONFIGS[profile]["model"]
-        print(f"[embed] Loading encoder for profile '{profile}': {model_name}")
-        _ENCODERS[profile] = SentenceTransformer(model_name)
-
-    _ACTIVE_PROFILE = profile
+        model_name = _resolve_model_name(profile)
+        print(f"[embed] Loading encoder for profile '{profile}': {model_name} on {_device()}")
+        _ENCODERS[profile] = SentenceTransformer(model_name, device=_device())
     return _ENCODERS[profile]
 
 
-def encode(text: str, profile: str) -> List[float]:
-    encoder = init_encoder_from_config(profile)
-    vec = encoder.encode([text])[0]
-    return [float(x) for x in vec]
+def set_encoder(key_or_model: str) -> SentenceTransformer:
+    global _CURRENT_KEY
+
+    if key_or_model in EMBEDDING_CONFIGS:
+        enc = init_encoder_from_config(key_or_model)
+        _CURRENT_KEY = key_or_model
+        return enc
+
+    custom_key = f"__custom__::{key_or_model}"
+    if custom_key not in _ENCODERS:
+        print(f"[embed] Loading custom encoder: {key_or_model} on {_device()}")
+        _ENCODERS[custom_key] = SentenceTransformer(key_or_model, device=_device())
+    _CURRENT_KEY = custom_key
+    return _ENCODERS[custom_key]
 
 
-def encode_many(texts: List[str], profile: str) -> List[List[float]]:
-    encoder = init_encoder_from_config(profile)
-    vecs = encoder.encode(texts, batch_size=32, show_progress_bar=False)
-    return [[float(x) for x in v] for v in vecs]
+def get_encoder(key: Optional[str] = None) -> SentenceTransformer:
+    use_key = key or _CURRENT_KEY
+    if not use_key:
+        raise RuntimeError("No encoder selected yet. Call set_encoder(profile_or_model) first.")
+    if use_key in _ENCODERS:
+        return _ENCODERS[use_key]
+    if use_key in EMBEDDING_CONFIGS:
+        return init_encoder_from_config(use_key)
+    raise RuntimeError(f"Encoder '{use_key}' not initialized.")
 
 
-def embedding_dim(profile: str) -> int:
-    if profile not in EMBEDDING_CONFIGS:
-        raise ValueError(f"Unknown profile '{profile}'")
-    return EMBEDDING_CONFIGS[profile]["dim"]
+def embedding_dim(key: Optional[str] = None) -> int:
+    use_key = key or _CURRENT_KEY
+    if not use_key:
+        raise RuntimeError("Call set_encoder(...) first.")
+
+    enc = get_encoder(use_key)
+    try:
+        return int(enc.get_sentence_embedding_dimension())
+    except Exception:
+        pass
+
+    if use_key in EMBEDDING_CONFIGS:
+        cfg = EMBEDDING_CONFIGS[use_key]
+        if "dim" in cfg:
+            return int(cfg["dim"])
+
+    return 768
 
 
-def active_profile() -> Optional[str]:
-    return _ACTIVE_PROFILE
+def encode_one(text: str, key: Optional[str] = None, normalize: bool = True) -> List[float]:
+    enc = get_encoder(key)
+    vec = enc.encode(text, normalize_embeddings=normalize)
+    return vec.tolist() if hasattr(vec, "tolist") else list(vec)
+
+
+def encode_batch(
+    texts: List[str],
+    key: Optional[str] = None,
+    batch_size: int = 32,
+    normalize: bool = True,
+) -> List[List[float]]:
+    enc = get_encoder(key)
+    vecs = enc.encode(texts, batch_size=batch_size, normalize_embeddings=normalize)
+    if hasattr(vecs, "tolist"):
+        return vecs.tolist()
+    return [list(v) for v in vecs]
+
+
+def encoder_name(key: Optional[str] = None) -> str:
+    enc = get_encoder(key)
+    try: 
+        return getattr(enc, "model_card", None) or getattr(enc, "model_name_or_path", "unknown")
+    except Exception:
+        return "unknown"
