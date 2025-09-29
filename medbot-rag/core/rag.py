@@ -1,74 +1,80 @@
 from __future__ import annotations
-from time import perf_counter
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-from config import INDEX_NAME
+import time
 
 
-def _as_list(x):
-    return x.tolist() if hasattr(x, "tolist") else x
+def _to_list_floats(vec: Any) -> List[float]:
+    try:
+        if hasattr(vec, "tolist"):
+            return [float(x) for x in vec.tolist()]
+        return [float(x) for x in vec]
+    except Exception:
+        raise TypeError("query vector must be iterable (list/tuple/numpy array) of numbers")
 
 
 def vector_search(
     col,
-    query_vec,
+    query_vector: Any,
+    *,
     top_k: int,
     num_candidates: int,
-    filters: Dict[str, Any] | None,
-    index_name: str = INDEX_NAME,
-    include_vector: bool = True,
+    filters: Optional[Dict[str, Any]] = None,
+    index_name: str,
+    include_vector: bool = False,
 ) -> Tuple[List[Dict[str, Any]], float]:
-    project = {
+    qvec = _to_list_floats(query_vector)
+    flt = filters or {}
+
+    project_fields = {
         "_id": 1,
+        "parent_id": 1,
+        "chunk_index": 1,
+        "source": 1,
         "text": 1,
-        "_score": {"$meta": "searchScore"},
+        "score": {"$meta": "vectorSearchScore"},
     }
     if include_vector:
-        project["vector"] = 1
+        project_fields["vector"] = 1
 
     pipeline = [
         {
             "$vectorSearch": {
                 "index": index_name,
                 "path": "vector",
-                "queryVector": _as_list(query_vec),
+                "queryVector": qvec,
                 "numCandidates": int(num_candidates),
                 "limit": int(top_k),
-                "filter": (filters or {}),
+                "filter": flt,
             }
         },
-        {"$project": project},
+        {"$project": project_fields},
     ]
 
-    t0 = perf_counter()
-    hits = list(col.aggregate(pipeline))
-    latency_ms = (perf_counter() - t0) * 1000.0
-    return hits, latency_ms
+    t0 = time.perf_counter()
+    docs = list(col.aggregate(pipeline))
+    t1 = time.perf_counter()
+    latency_ms = round((t1 - t0) * 1000.0, 2)
+
+    for d in docs:
+        try:
+            d["_score"] = float(d.get("score", 0.0) or 0.0)
+        except Exception:
+            d["_score"] = 0.0
+
+    return docs, latency_ms
 
 
-def apply_threshold(hits: Sequence[Dict[str, Any]], threshold: float) -> tuple[bool, float, float]:
-    scores = [float(h.get("_score", 0.0)) for h in hits]
+def apply_threshold(hits: List[Dict[str, Any]], threshold: Optional[float]) -> Tuple[bool, float, float]:
+    scores = [float(h.get("_score", 0.0) or 0.0) for h in hits] if hits else []
     if not scores:
-        return True, 0.0, 0.0
-    mx = max(scores)
-    mean = sum(scores) / len(scores)
-    return (mx < threshold), mx, mean
+        return (True, 0.0, 0.0) if threshold is not None else (True, 0.0, 0.0)
 
+    max_s = max(scores)
+    mean_s = sum(scores) / len(scores)
 
-def to_contexts(
-    hits: Sequence[Dict[str, Any]],
-    max_chars: int = 700,
-    keep_vector: bool = True,
-) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    for i, h in enumerate(hits, 1):
-        item = {
-            "id": str(h.get("_id", f"ctx-{i}")),
-            "text": (h.get("text") or "")[:max_chars],
-            "score": float(h.get("_score", 0.0)),
-        }
-        if keep_vector and "vector" in h:
-            item["vector"] = h["vector"]
-        out.append(item)
-    return out
+    if threshold is None:
+        return (False, max_s, mean_s)
 
+    insufficient = max_s < float(threshold)
+    return insufficient, max_s, mean_s
