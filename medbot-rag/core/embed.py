@@ -1,18 +1,20 @@
 from __future__ import annotations
-from typing import Dict, Optional, List, Union
+from typing import Dict, Optional, List, Iterable
 
 import os
+
 try:
-    import torch
+    import torch  
     _HAS_TORCH = True
 except Exception:
     _HAS_TORCH = False
 
 from sentence_transformers import SentenceTransformer
-from config import EMBEDDING_CONFIGS  
+from config import EMBEDDING_CONFIGS 
+
+# Global encoder registry
 
 _ENCODERS: Dict[str, SentenceTransformer] = {}
-
 _CURRENT_KEY: Optional[str] = None
 
 
@@ -33,11 +35,11 @@ def _resolve_model_name(profile: str) -> str:
     return name
 
 
+# Encoder lifecycle
+
 def init_encoder_from_config(profile: str) -> SentenceTransformer:
     if profile not in EMBEDDING_CONFIGS:
-        raise ValueError(
-            f"Unknown profile '{profile}'. Options: {list(EMBEDDING_CONFIGS.keys())}"
-        )
+        raise ValueError(f"Unknown profile '{profile}'. Options: {list(EMBEDDING_CONFIGS.keys())}")
     if profile not in _ENCODERS:
         model_name = _resolve_model_name(profile)
         print(f"[embed] Loading encoder for profile '{profile}': {model_name} on {_device()}")
@@ -72,6 +74,14 @@ def get_encoder(key: Optional[str] = None) -> SentenceTransformer:
     raise RuntimeError(f"Encoder '{use_key}' not initialized.")
 
 
+def clear_encoders() -> None:
+    _ENCODERS.clear()
+    global _CURRENT_KEY
+    _CURRENT_KEY = None
+
+
+# Introspection
+
 def embedding_dim(key: Optional[str] = None) -> int:
     use_key = key or _CURRENT_KEY
     if not use_key:
@@ -90,6 +100,16 @@ def embedding_dim(key: Optional[str] = None) -> int:
 
     return 768
 
+
+def encoder_name(key: Optional[str] = None) -> str:
+    enc = get_encoder(key)
+    try:
+        return getattr(enc, "model_card", None) or getattr(enc, "model_name_or_path", "unknown")
+    except Exception:
+        return "unknown"
+
+
+# Core encoding helpers
 
 def encode_one(text: str, key: Optional[str] = None, normalize: bool = True) -> List[float]:
     enc = get_encoder(key)
@@ -110,9 +130,33 @@ def encode_batch(
     return [list(v) for v in vecs]
 
 
-def encoder_name(key: Optional[str] = None) -> str:
-    enc = get_encoder(key)
-    try: 
-        return getattr(enc, "model_card", None) or getattr(enc, "model_name_or_path", "unknown")
-    except Exception:
-        return "unknown"
+# Compatibility wrappers (used by main.py / scripts/run_ingest.py)
+
+def encode(text: str, *, profile: Optional[str] = None, normalize: bool = True) -> List[float]:
+    if profile:
+        set_encoder(profile)
+    return encode_one(text, key=None, normalize=normalize)
+
+
+def encode_many(
+    texts: Iterable[str],
+    *,
+    profile: Optional[str] = None,
+    batch_size: int = 32,
+    normalize: bool = True,
+) -> List[List[float]]:
+    if profile:
+        set_encoder(profile)
+    return encode_batch(list(texts), key=None, batch_size=batch_size, normalize=normalize)
+
+
+# Public API
+
+__all__ = [
+    # lifecycle
+    "set_encoder", "get_encoder", "init_encoder_from_config", "clear_encoders",
+    # info
+    "embedding_dim", "encoder_name",
+    # encoding
+    "encode_one", "encode_batch", "encode", "encode_many",
+]
