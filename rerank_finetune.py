@@ -173,9 +173,16 @@ def load_bioasq_generated_local(jsonl_gz: Path, negatives_per_query=4, max_sampl
     Fields include: _id, title, text, query. We use (query, title+text) as positive.
     Negatives sampled from a rolling buffer.
     """
+    # Accept either compressed or uncompressed file
     if not jsonl_gz.exists():
-        print(f"[BioASQ-gen] {jsonl_gz} not found → skipping.", flush=True)
-        return
+        # try uncompressed twin (…/train.jsonl)
+        alt = Path(str(jsonl_gz).removesuffix(".gz")) if str(jsonl_gz).endswith(".gz") else jsonl_gz.with_suffix("")
+        if alt.exists():
+            print(f"[BioASQ-gen] {jsonl_gz} not found; using {alt}", flush=True)
+            jsonl_gz = alt
+        else:
+            print(f"[BioASQ-gen] {jsonl_gz} not found → skipping.", flush=True)
+            return
 
     rnd = random.Random(seed)
     buf = []  # store docs for negatives
@@ -353,9 +360,13 @@ def launch_flagembedding_train(
     if weight_decay and weight_decay > 0: cmd += ["--weight_decay", str(weight_decay)]
     if deepspeed_config: cmd += ["--deepspeed", deepspeed_config]
 
+    # If using DDP, wrap with torchrun (no HF flags here)
     if nproc and int(nproc) > 1:
-        # keep DDP robust
-        cmd = ["torchrun", "--nproc_per_node", str(nproc), "--ddp_find_unused_parameters", "False"] + cmd
+        cmd = ["torchrun", "--nproc_per_node", str(nproc)] + cmd
+
+    # Tell HF/Trainer (inside FlagEmbedding) how to handle unused params
+    # (safe both for single- and multi-GPU)
+    cmd += ["--ddp_find_unused_parameters", "False"]
 
     print("\n[Train CMD]\n", " ".join(cmd), "\n", flush=True)
     subprocess.run(cmd, check=True)
