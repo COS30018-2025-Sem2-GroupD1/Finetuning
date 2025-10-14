@@ -1,0 +1,29 @@
+# Core deep learning stack (CUDA 12.x compatible)
+torch>=2.2.0
+accelerate>=0.30.0
+
+# Hugging Face ecosystem
+transformers>=4.42.0
+sentencepiece>=0.1.99
+tokenizers>=0.19.1
+
+# Data and utilities
+pandas>=2.2.0
+tqdm>=4.66.4
+numpy>=1.26.4
+lxml>=5.1.0
+
+# Evaluation metrics
+rouge-score>=0.1.2
+bert-score>=0.3.13
+
+# Optional: safer YAML/JSON ops and pretty logs
+pyyaml>=6.0.2
+colorlog>=6.8.2
+
+# Optional: compression utilities for large result files
+gzip-reader>=0.2.0
+
+# HPC stability
+psutil>=5.9.8
+
