@@ -1,0 +1,14 @@
+# Core deep-learning stack
+torch==2.1.2+cu118              
+--extra-index-url https://download.pytorch.org/whl/cu118
+
+transformers==4.42.4
+peft==0.11.1                   
+accelerate==0.30.1
+safetensors==0.4.3
+
+# Utilities
+tqdm==4.66.5
+numpy>=1.24,<2.0
+sentencepiece>=0.1.99         
+protobuf>=3.20.3,<5.0         
