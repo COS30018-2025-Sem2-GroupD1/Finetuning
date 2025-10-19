@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 import os, sys, json, math, time, argparse, random
+
+os.environ['TRANSFORMERS_OFFLINE'] = '1'
+os.environ['HF_DATASETS_OFFLINE'] = '1'
+
 import torch
 import pandas as pd
 from tqdm import tqdm
@@ -11,8 +15,7 @@ torch.set_float32_matmul_precision('high')
 
 INSTR = (
 "You are a careful clinical assistant. Answer the patient question using "
-"general, authoritative medical knowledge. Be concise (<=150 words), avoid 
-speculation. "
+"general, authoritative medical knowledge. Be concise (<=150 words), avoid spec>
 "If unsure, say: I don't know."
 )
 
@@ -27,8 +30,7 @@ def tok_f1(ref, cand):
     r_counts, c_counts = {}, {}
     for w in r: r_counts[w] = r_counts.get(w, 0) + 1
     for w in c: c_counts[w] = c_counts.get(w, 0) + 1
-    overlap = sum(min(r_counts.get(w,0), c_counts.get(w,0)) for w in 
-set(r_counts.keys()) | set(c_counts.keys()))
+    overlap = sum(min(r_counts.get(w,0), c_counts.get(w,0)) for w in set(r_coun>
     prec = overlap / max(1, len(c))
     rec  = overlap / max(1, len(r))
     if prec+rec == 0: return 0.0
@@ -38,8 +40,7 @@ def ngram_precision(ref, cand, n=1):
     r = norm_text(ref).lower().split()
     c = norm_text(cand).lower().split()
     if len(c) < n: return 0.0
-    def ngrams(x, n): return [" ".join(x[i:i+n]) for i in 
-range(len(x)-n+1)]
+    def ngrams(x, n): return [" ".join(x[i:i+n]) for i in range(len(x)-n+1)]
     rset = set(ngrams(r, n))
     cgrams = ngrams(c, n)
     if not cgrams: return 0.0
@@ -48,27 +49,22 @@ range(len(x)-n+1)]
 
 @torch.inference_mode()
 def load_model(path, bf16_ok=True):
-    tok = AutoTokenizer.from_pretrained(path, trust_remote_code=True, 
-use_fast=True)
+    tok = AutoTokenizer.from_pretrained(path, trust_remote_code=True, use_fast=>
     if tok.pad_token_id is None:
         tok.pad_token = tok.eos_token or "<|pad|>"
     tok.padding_side = "left"
     tok.truncation_side = "left"
-    dtype = torch.bfloat16 if (bf16_ok and torch.cuda.is_bf16_supported()) 
-else (torch.float16 if torch.cuda.is_available() else torch.float32)
-    model = AutoModelForCausalLM.from_pretrained(path, device_map="auto", 
-torch_dtype=dtype, low_cpu_mem_usage=True, trust_remote_code=True)
+    dtype = torch.bfloat16 if (bf16_ok and torch.cuda.is_bf16_supported()) else>
+    model = AutoModelForCausalLM.from_pretrained(path, device_map="auto", torch>
     model.generation_config.pad_token_id = tok.pad_token_id
     return tok, model
 
 @torch.inference_mode()
 def generate_batch(tok, model, prompts, max_new_tokens=256):
     # keep input within context
-    ctx = getattr(model.config, "max_position_embeddings", 
-getattr(model.config, "n_positions", 4096))
+    ctx = getattr(model.config, "max_position_embeddings", getattr(model.config>
     max_inp = max(128, int(ctx) - int(max_new_tokens) - 8)
-    enc = tok(prompts, return_tensors="pt", padding=True, truncation=True, 
-max_length=max_inp).to(model.device)
+    enc = tok(prompts, return_tensors="pt", padding=True, truncation=True, max_>
     out = model.generate(
         **enc,
         max_new_tokens=max_new_tokens,
@@ -85,13 +81,10 @@ max_length=max_inp).to(model.device)
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data-jsonl", required=True, 
-help="data/medquad/processed/medquad_clean.jsonl")
-    ap.add_argument("--model-dirs", nargs="+", required=True, help="e.g., 
-model/medalpaca-7b model/medgemma-27b-text-it")
+    ap.add_argument("--data-jsonl", required=True, help="data/medquad/processed>
+    ap.add_argument("--model-dirs", nargs="+", required=True, help="e.g., model>
     ap.add_argument("--outdir", default="data/medquad/runs")
-    ap.add_argument("--max-samples", type=int, default=5000, help="cap for 
-speed; set higher to run full")
+    ap.add_argument("--max-samples", type=int, default=5000, help="cap for spee>
     ap.add_argument("--seed", type=int, default=13)
     ap.add_argument("--batch-size", type=int, default=4)
     ap.add_argument("--max-new-tokens", type=int, default=256)
@@ -105,8 +98,7 @@ speed; set higher to run full")
     with open(args.data_jsonl, "r", encoding="utf-8") as f:
         for line in f:
             obj = json.loads(line)
-            rows.append({"id": obj["id"], "q": obj["question"], "a": 
-obj["answer"]})
+            rows.append({"id": obj["id"], "q": obj["question"], "a": obj["answe>
     random.shuffle(rows)
     if args.max_samples and args.max_samples < len(rows):
         rows = rows[:args.max_samples]
@@ -130,13 +122,12 @@ obj["answer"]})
                 f"{INSTR}\n\nQuestion: {norm_text(x['q'])}\n\nAnswer:"
                 for x in batch
             ]
-            outs = generate_batch(tok, model, prompts, 
-max_new_tokens=args.max_new_tokens)
+            outs = generate_batch(tok, model, prompts, max_new_tokens=args.max_>
             for b, gen in zip(batch, outs):
                 preds.append(norm_text(gen))
                 refs.append(norm_text(b["a"]))
                 qids.append(b["id"])
-
+                                  
         # Metrics: Rouge-L, token F1, n-gram precision
         rougeL_f, tokF1, uniP, biP = [], [], [], []
         for ref, hyp in zip(refs, preds):
@@ -147,8 +138,7 @@ max_new_tokens=args.max_new_tokens)
             biP.append(ngram_precision(ref, hyp, 2))
 
         # BERTScore (batched)
-        P, R, F = bertscore(preds, refs, lang="en", 
-rescale_with_baseline=True)
+        P, R, F = bertscore(preds, refs, lang="en", rescale_with_baseline=True,>
         bsf = F.tolist()
 
         df = pd.DataFrame({
@@ -156,9 +146,8 @@ rescale_with_baseline=True)
             "rougeL_f": rougeL_f, "bert_f": bsf,
             "tok_f1": tokF1, "uni_prec": uniP, "bi_prec": biP
         })
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        out_csv = os.path.join(args.outdir, 
-f"{mname}_medquad_{stamp}.csv")
+	stamp = time.strftime("%Y%m%d-%H%M%S")
+        out_csv = os.path.join(args.outdir, f"{mname}_medquad_{stamp}.csv")
         df.to_csv(out_csv, index=False, encoding="utf-8")
         print(f"[saved] {out_csv}")
 
@@ -182,8 +171,7 @@ f"{mname}_medquad_{stamp}.csv")
 
     # Write overall summary
     summary_df = pd.DataFrame(summary_rows)
-    out_sum = os.path.join(args.outdir, 
-f"SUMMARY_{time.strftime('%Y%m%d-%H%M%S')}.csv")
+    out_sum = os.path.join(args.outdir, f"SUMMARY_{time.strftime('%Y%m%d-%H%M%S>
     summary_df.to_csv(out_sum, index=False)
     print("\n=== SUMMARY ===")
     print(summary_df)
@@ -191,4 +179,3 @@ f"SUMMARY_{time.strftime('%Y%m%d-%H%M%S')}.csv")
 
 if __name__ == "__main__":
     main()
-
