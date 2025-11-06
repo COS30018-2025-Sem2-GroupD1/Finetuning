@@ -1,0 +1,18 @@
+# Core
+transformers>=4.43
+accelerate>=0.30
+peft>=0.10
+
+# FlagEmbedding with finetune extras
+FlagEmbedding
+
+# Datasets and Parquet
+datasets>=2.19
+pyarrow>=15.0
+
+# Utilities
+numpy>=1.26
+ujson>=5.10
+tqdm==4.66.4
+scikit-learn==1.4.2
+scipy==1.11.4
