@@ -1,79 +1,107 @@
 #!/usr/bin/env python3
-import os, sys, json, glob
-from lxml import etree
-from tqdm import tqdm
+import os
+import sys
+import json
+import pandas as pd
 
 """
-Parse MedQuAD XML into a clean JSONL:
-- fields: id, question, answer, url, type, focus
-- skip the three MedlinePlus subsets with removed answers
+Prep MedQuAD from a single Parquet file into JSONL:
+
+Input:  Parquet with columns:
+  document_id, document_source, document_url, category,
+  umls_cui, umls_semantic_types, umls_semantic_group,
+  synonyms, question_id, question_focus, question_type,
+  question, answer
+
+Output JSONL fields (per line):
+  id, question, answer,
+  url, type, focus, category,
+  document_id, document_source,
+  umls_cui, umls_semantic_types, umls_semantic_group,
+  synonyms
+
+Exe:
+python scripts/prep_medquad.py \
+  data/medquad/medquad.parquet \
+  data/medquad/processed/medquad_clean.jsonl
 """
 
-EXCLUDE_DIRS = {
-    "10_MPlus_ADAM_QA",
-    "11_MPlusDrugs_QA",
-    "12_MPlusHerbsSupplements_QA",
-}
-
-def text_or_none(x):
-    return (x or "").strip() if isinstance(x, str) else None
-
-def find_first(root, cand_tags):
-    # Case- and namespace-insensitive
-    cand = {t.lower() for t in cand_tags}
-    for el in root.iter():
-        tag = el.tag
-        if isinstance(tag, str):
-            name = tag.split("}")[-1].lower()
-            if name in cand:
-                if el.text and el.text.strip():
-                    return el.text.strip()
-    return None
-
-def parse_xml(xml_path):
-    root = etree.parse(xml_path).getroot()
-    q = find_first(root, ["Question", "question", "q_text", "q"])
-    a = find_first(root, ["Answer", "answer", "a_text", "a", 
-"AnswerText"])
-    u = find_first(root, ["URL", "url", "link"])
-    t = find_first(root, ["Type", "type", "QuestionType"])
-    f = find_first(root, ["Focus", "focus"])
-    return q, a, u, t, f
+def norm_or_none(x):
+    """Convert NaN/None to None, strip strings; empty -> None."""
+    if x is None:
+        return None
+    # Handle pandas NaN
+    try:
+        if isinstance(x, float) and pd.isna(x):
+            return None
+    except Exception:
+        pass
+    s = str(x).strip()
+    return s if s else None
 
 def main():
     if len(sys.argv) != 3:
-        print("Usage: prep_medquad.py <input_medquad_dir> <out_jsonl>")
+        print("Usage: prep_medquad.py <input_parquet> <out_jsonl>")
         sys.exit(1)
 
-    in_dir = sys.argv[1]
+    in_path = sys.argv[1]
     out_path = sys.argv[2]
-    n_total = n_kept = 0
+
+    if not os.path.exists(in_path):
+        print(f"ERROR: input parquet not found: {in_path}")
+        sys.exit(1)
+
+    print(f"[info] Loading Parquet: {in_path}")
+    df = pd.read_parquet(in_path)
+
+    required = ["question_id", "question", "answer"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        print(f"ERROR: missing required columns in parquet: {missing}")
+        sys.exit(1)
+
+    n_total = len(df)
+    n_kept = 0
 
     with open(out_path, "w", encoding="utf-8") as fout:
-        for xml_path in tqdm(sorted(glob.glob(os.path.join(in_dir, "*", 
-"*.xml")))):
-            parts = set(os.path.normpath(xml_path).split(os.sep))
-            if parts & EXCLUDE_DIRS:
+        for idx, row in df.iterrows():
+            q = norm_or_none(row.get("question"))
+            a = norm_or_none(row.get("answer"))
+            if not q or not a:
+                # Skip rows without usable Q/A
                 continue
-            n_total += 1
-            try:
-                q, a, u, t, f = parse_xml(xml_path)
-                if q and a:
-                    _id = os.path.splitext(os.path.basename(xml_path))[0]
-                    rec = {
-                        "id": _id, "question": q, "answer": a,
-                        "url": text_or_none(u), "type": text_or_none(t),
-                        "focus": text_or_none(f)
-                    }
-                    fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                    n_kept += 1
-            except Exception as e:
-                # silently skip bad files
-                pass
 
-    print(f"Done. Parsed={n_total}, kept(with answers)={n_kept}, 
-out={out_path}")
+            qid  = norm_or_none(row.get("question_id"))
+            doc_id = norm_or_none(row.get("document_id"))
+
+            if qid:
+                rec_id = qid
+            elif doc_id:
+                rec_id = f"{doc_id}_{idx}"
+            else:
+                rec_id = str(idx)
+
+            rec = {
+                "id": rec_id,
+                "question": q,
+                "answer": a,
+                # useful metadata (bench script will just ignore these)
+                "url": norm_or_none(row.get("document_url")),
+                "type": norm_or_none(row.get("question_type")),
+                "focus": norm_or_none(row.get("question_focus")),
+                "category": norm_or_none(row.get("category")),
+                "document_id": doc_id,
+                "document_source": norm_or_none(row.get("document_source")),
+                "umls_cui": norm_or_none(row.get("umls_cui")),
+                "umls_semantic_types": norm_or_none(row.get("umls_semantic_types")),
+                "umls_semantic_group": norm_or_none(row.get("umls_semantic_group")),
+                "synonyms": norm_or_none(row.get("synonyms")),
+            }
+
+            fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            n_kept += 1
+
+    print(f"Done. Parsed={n_total}, kept(with Q&A)={n_kept}, out={out_path}")
 
 if __name__ == "__main__":
     main()
-
