@@ -1,0 +1,13 @@
+Training log summary
+====================
+
+Best eval_loss: 0.127623 at step 2000 (epoch 0.5373996574077184)
+
+Avg eval_runtime: 3616.7 s  (min 3586.1, max 3624.7)
+Avg eval samples/s: 2.058
+Avg eval steps/s:   0.257
+Train runtime (last): 77701.3 s (~21.58 h)
+Train steps/s (last): 0.144
+Train samples/s (last): 2.299
+
+WARNING: Multiple eval entries at same step(s): [2000]. Ensure consistent split/metrics across evaluations.
